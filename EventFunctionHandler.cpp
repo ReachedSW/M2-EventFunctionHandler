@@ -8,6 +8,19 @@
 #include "config.h"
 #include "EventFunctionHandler.h"
 
+void CEventFunctionHandler::SFunctionHandler::ApplyDelay(const long delay)
+{
+	const size_t now = timeBase == ETimeBase::Pulses ? static_cast<size_t>(thecore_pulse()) : static_cast<size_t>(get_global_time());
+	dueAt = now + static_cast<size_t>(std::max<long>(1, delay));
+	++generation;
+}
+
+long CEventFunctionHandler::SFunctionHandler::GetRemaining(const size_t currentSeconds, const size_t currentPulse) const
+{
+	const size_t now = timeBase == ETimeBase::Pulses ? currentPulse : currentSeconds;
+	return dueAt > now ? static_cast<long>(dueAt - now) : 0;
+}
+
 void CEventFunctionHandler::Destroy()
 {
 	m_event.clear();
@@ -24,10 +37,17 @@ void CEventFunctionHandler::Destroy()
 */
 bool CEventFunctionHandler::AddEvent(std::function<void(SArgumentSupportImpl *)> func, const std::string_view event_name, const size_t time, const bool loop)
 {
-	if (GetHandlerByName(event_name))
-		return false;
-	m_event.emplace(event_name, std::make_unique<SFunctionHandler>(std::move(func), time, loop));
-	return true;
+	EventCallback wrappedFunc = [wrapped = std::move(func)](SArgumentSupportImpl* arg) -> long
+	{
+		wrapped(arg);
+		return 0;
+	};
+	return AddEventInternal(std::move(wrappedFunc), event_name, static_cast<long>(time), loop, ETimeBase::Seconds);
+}
+
+bool CEventFunctionHandler::AddPulseEvent(EventCallback func, const std::string_view event_name, const long pulseDelay)
+{
+	return AddEventInternal(std::move(func), event_name, pulseDelay, false, ETimeBase::Pulses);
 }
 
 /*
@@ -38,7 +58,8 @@ bool CEventFunctionHandler::AddEvent(std::function<void(SArgumentSupportImpl *)>
 */
 void CEventFunctionHandler::RemoveEvent(const std::string_view event_name)
 {
-	m_event.erase(std::string(event_name));
+	if (auto it = m_event.find(event_name); it != m_event.end())
+		m_event.erase(it);
 }
 
 /*
@@ -50,8 +71,8 @@ void CEventFunctionHandler::RemoveEvent(const std::string_view event_name)
 */
 void CEventFunctionHandler::DelayEvent(const std::string_view event_name, const size_t newtime)
 {
-	if (auto ptr = GetHandlerByName(event_name); ptr && !ptr->IsLooped())
-		ptr->UpdateTime(newtime);
+	if (auto ptr = GetHandlerByName(event_name); ptr && !ptr->IsLooped() && ptr->timeBase == ETimeBase::Seconds)
+		ScheduleEvent(event_name, *ptr, static_cast<long>(newtime));
 }
 
 /*
@@ -73,8 +94,19 @@ bool CEventFunctionHandler::FindEvent(const std::string_view event_name) const
 */
 DWORD CEventFunctionHandler::GetDelay(const std::string_view event_name) const
 {
-	if (const auto ptr = GetHandlerByName(event_name); ptr && ptr->time >= get_global_time())
-		return ptr->time - get_global_time();
+	const auto currentSeconds = static_cast<size_t>(get_global_time());
+	const auto currentPulse = static_cast<size_t>(thecore_pulse());
+	if (const auto ptr = GetHandlerByName(event_name))
+	{
+		const long remaining = ptr->GetRemaining(currentSeconds, currentPulse);
+		if (remaining <= 0)
+			return 0;
+
+		if (ptr->timeBase == ETimeBase::Pulses)
+			return static_cast<DWORD>(remaining / std::max(1, passes_per_sec));
+
+		return static_cast<DWORD>(remaining);
+	}
 	return 0;
 }
 
@@ -83,32 +115,91 @@ void CEventFunctionHandler::Process()
 	if (m_event.empty())
 		return;
 
-	const auto current_time = get_global_time();
-	std::vector<std::function<void(SArgumentSupportImpl*)>> v_function_call;
-
-	std::erase_if(m_event, [&](const auto& pair)
-	{
-		const auto& [event_name, event_fnc] = pair;
-		if (current_time >= event_fnc->time)
-		{
-			v_function_call.emplace_back(event_fnc->func);
-			if (event_fnc->IsLooped())
-			{
-				event_fnc->UpdateNextLoopTime();
-				return false;
-			}
-			return true;
-		}
-		return false;
-	});
-
-	for (const auto& func : v_function_call)
-		func(nullptr);
+	const auto currentSeconds = static_cast<size_t>(get_global_time());
+	const auto currentPulse = static_cast<size_t>(thecore_pulse());
+	ProcessQueue(m_secondsQueue, ETimeBase::Seconds, currentSeconds);
+	ProcessQueue(m_pulseQueue, ETimeBase::Pulses, currentPulse);
 }
 
-CEventFunctionHandler::SFunctionHandler * CEventFunctionHandler::GetHandlerByName(const std::string_view event_name) const
+std::priority_queue<CEventFunctionHandler::SHeapEntry>& CEventFunctionHandler::GetQueue(const ETimeBase timeBase)
 {
-	if (auto it = m_event.find(std::string(event_name)); it != m_event.end())
+	return timeBase == ETimeBase::Pulses ? m_pulseQueue : m_secondsQueue;
+}
+
+bool CEventFunctionHandler::AddEventInternal(EventCallback func, const std::string_view event_name, const long delay, const bool loop, const ETimeBase timeBase)
+{
+	if (GetHandlerByName(event_name))
+		return false;
+
+	auto handler = std::make_unique<SFunctionHandler>();
+	handler->func = std::move(func);
+	handler->timeBase = timeBase;
+	handler->loopTime = loop ? delay : 0;
+	handler->ApplyDelay(delay);
+
+	auto [it, inserted] = m_event.emplace(event_name, std::move(handler));
+	if (!inserted)
+		return false;
+
+	GetQueue(timeBase).push(SHeapEntry{it->second->dueAt, it->second->generation, it->first});
+	return true;
+}
+
+void CEventFunctionHandler::ScheduleEvent(const std::string_view event_name, SFunctionHandler& handler, const long delay)
+{
+	handler.ApplyDelay(delay);
+	GetQueue(handler.timeBase).push(SHeapEntry{handler.dueAt, handler.generation, std::string(event_name)});
+}
+
+void CEventFunctionHandler::ProcessQueue(std::priority_queue<SHeapEntry>& queue, const ETimeBase timeBase, const size_t now)
+{
+	while (!queue.empty() && queue.top().dueAt <= now)
+	{
+		const SHeapEntry heapEntry = queue.top();
+		queue.pop();
+
+		auto it = m_event.find(heapEntry.key);
+		if (it == m_event.end())
+			continue;
+
+		SFunctionHandler& handler = *it->second;
+		if (handler.timeBase != timeBase || handler.generation != heapEntry.generation || handler.dueAt != heapEntry.dueAt)
+			continue;
+
+		const long nextDelay = handler.func(nullptr);
+
+		it = m_event.find(heapEntry.key);
+		if (it == m_event.end())
+			continue;
+
+		SFunctionHandler& currentHandler = *it->second;
+		if (currentHandler.timeBase != timeBase || currentHandler.generation != heapEntry.generation || currentHandler.dueAt != heapEntry.dueAt)
+			continue;
+
+		if (nextDelay > 0)
+		{
+			ScheduleEvent(it->first, currentHandler, nextDelay);
+			continue;
+		}
+
+		if (currentHandler.IsLooped())
+		{
+			ScheduleEvent(it->first, currentHandler, currentHandler.loopTime);
+			continue;
+		}
+
+		m_event.erase(it);
+	}
+}
+
+const CEventFunctionHandler::SFunctionHandler* CEventFunctionHandler::GetHandlerByName(const std::string_view event_name) const
+{
+	if (auto it = m_event.find(event_name); it != m_event.end())
 		return it->second.get();
 	return nullptr;
+}
+
+CEventFunctionHandler::SFunctionHandler* CEventFunctionHandler::GetHandlerByName(const std::string_view event_name)
+{
+	return const_cast<SFunctionHandler*>(std::as_const(*this).GetHandlerByName(event_name));
 }
